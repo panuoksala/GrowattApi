@@ -1,13 +1,12 @@
-﻿using Ealse.Growatt.Api.Helpers;
-using System;
-using System.Net.Http;
-using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Text.Json;
-using System.Net;
-using System.Linq;
-using Ealse.Growatt.Api.Converters;
+﻿using Ealse.Growatt.Api.Extensions;
 using Ealse.Growatt.Api.Models;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Ealse.Growatt.Api
 {
@@ -15,22 +14,21 @@ namespace Ealse.Growatt.Api
     {
         public string Username { get; private set; }
 
-        public string Md5Password { get; private set; }
+        public string Password { get; private set; }
 
-        public Uri GrowattApiBaseUrl => new Uri("https://server.growatt.com/");
-
-        public string UserAgent => "";
-
-        private readonly CookieContainer cookieContainer = new CookieContainer();
+        public Uri GrowattApiBaseUrl { get; set; } = new Uri("https://server.growatt.com/");
 
         public bool IsAuthenticated { get; set; }
+        public string UserAgent { get; set; } = string.Empty;
+
+        private readonly CookieContainer cookieContainer = new CookieContainer();
 
         private readonly HttpClient client;
 
         public Session(string username, string password)
         {
             Username = username;
-            Md5Password = password.CalculateMD5Hash();
+            Password = password;
 
             // Add a HttpClient to the session to allow for network communication
             client = CreateHttpClient();
@@ -79,12 +77,14 @@ namespace Ealse.Growatt.Api
 
         private async Task<LoginInfo> GetNewSession()
         {
-
+            var loginInfo = new LoginInfo();
+            loginInfo.IsAuthenticated = false;
             var content = new FormUrlEncodedContent(new[]
             {
-                    new KeyValuePair<string, string>("userName", Username),
-                    new KeyValuePair<string, string>("password", Md5Password),
-                });
+                new KeyValuePair<string, string>("account", Username),
+                new KeyValuePair<string, string>("password", Password),
+                new KeyValuePair<string, string>("validateCode", string.Empty),
+            });
 
             var response = client.PostAsync(LoginRelativeUrl, content).Result;
 
@@ -92,17 +92,13 @@ namespace Ealse.Growatt.Api
             {
                 // Request was successful
                 var responseString = await response.Content.ReadAsStringAsync();
-                try
+                if (responseString.Equals("{\"result\":1}"))
                 {
-                    return JsonSerializer.Deserialize<LoginInfo>(GetRootJsonObject(responseString));
-                }
-                catch
-                {
-                    throw new Exceptions.SessionAuthenticationFailedException();
+                    loginInfo.IsAuthenticated = true;
                 }
             }
 
-            throw new Exceptions.SessionAuthenticationFailedException();
+            return loginInfo;
         }
 
         /// <summary>
@@ -112,18 +108,12 @@ namespace Ealse.Growatt.Api
         /// <param name="uri">Uri of the webservice to send the message to</param>
         /// <param name="expectedHttpStatusCode">The expected Http result status code. Optional. If provided and the webservice returns a different response, the return type will be NULL to indicate failure.</param>
         /// <returns>Typed entity with the result from the webservice</returns>
-        protected virtual async Task<T> GetMessageReturnResponse<T>(Uri uri, HttpStatusCode? expectedHttpStatusCode = null)
+        protected virtual async Task<string> GetMessageReturnResponse(Uri uri, HttpStatusCode? expectedHttpStatusCode = null)
         {
             if (!IsAuthenticated || !cookieContainer.GetCookies(GrowattApiBaseUrl).Cast<Cookie>().Any(cookie => !cookie.Expired))
             {
                 await Authenticate();
             }
-
-            var options = new JsonSerializerOptions
-            {
-                Converters = { new PlantDetailDayDataConverter(), new PlantDetailMonthDataConverter(), new PlantDetailYearDataConverter(), new PlantDetailTotalDataConverter() }
-            };
-
 
             // Construct the request towards the webservice
             using (var request = new HttpRequestMessage(HttpMethod.Get, uri))
@@ -135,12 +125,9 @@ namespace Ealse.Growatt.Api
                     {
                         if (!expectedHttpStatusCode.HasValue || (expectedHttpStatusCode.HasValue && response != null && response.StatusCode == expectedHttpStatusCode.Value))
                         {
-                            var responseString = await response.Content.ReadAsStringAsync();
-
-                            var responseEntity = JsonSerializer.Deserialize<T>(GetRootJsonObject(responseString), options);
-                            return responseEntity;
+                            return await response.Content.ReadAsStringAsync();
                         }
-                        return default;
+                        throw new Exceptions.RequestFailedException(uri, new Exception("Invalid HTTP Status Code returned"));
                     }
                 }
                 catch (Exception ex)
@@ -151,19 +138,59 @@ namespace Ealse.Growatt.Api
             }
         }
 
-        private string GetRootJsonObject(string jsonResponse)
+        /// <summary>
+        /// Sends a message to the Tado API and returns the provided object of type T with the response
+        /// </summary>
+        /// <typeparam name="T">Object type of the expected response</typeparam>
+        /// <param name="uri">Uri of the webservice to send the message to</param>
+        /// <param name="expectedHttpStatusCode">The expected Http result status code. Optional. If provided and the webservice returns a different response, the return type will be NULL to indicate failure.</param>
+        /// <returns>Typed entity with the result from the webservice</returns>
+        protected virtual async Task<string> PostMessageReturnResponse(Uri uri, HttpContent body, HttpStatusCode? expectedHttpStatusCode = null)
         {
-            if (string.IsNullOrEmpty(jsonResponse))
+            if (!IsAuthenticated || !cookieContainer.GetCookies(GrowattApiBaseUrl).Cast<Cookie>().Any(cookie => !cookie.Expired))
             {
-                return string.Empty;
+                await Authenticate();
             }
 
-            using (JsonDocument document = JsonDocument.Parse(jsonResponse))
+            // Construct the request towards the webservice
+            using (var request = new HttpRequestMessage(HttpMethod.Post, uri))
             {
-                document.RootElement.TryGetProperty("back", out JsonElement elementWithBackProperty);
-                var result = elementWithBackProperty.ToString();
-                return string.IsNullOrEmpty(result) ? jsonResponse : result;
+                try
+                {
+                    // Request the response from the webservice
+                    using (var response = await client.PostAsync(request.RequestUri, body))
+                    {
+                        if (!expectedHttpStatusCode.HasValue || (expectedHttpStatusCode.HasValue && response != null && response.StatusCode == expectedHttpStatusCode.Value))
+                        {
+                            return await response.Content.ReadAsStringAsync();
+                        }
+                        throw new Exceptions.RequestFailedException(uri, new Exception("Invalid HTTP Status Code returned"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Request was not successful. throw an exception
+                    throw new Exceptions.RequestFailedException(uri, ex);
+                }
             }
+        }
+
+        private async Task<responseType> GetPostResponseData<responseType>(HttpContent content, Uri uri, string jsonPath)
+        {
+            var response = await PostMessageReturnResponse(uri, content, HttpStatusCode.OK);
+            var result = JsonSerializer.Deserialize<responseType>(response.GetPartOfJson(jsonPath));
+
+            if (result == null) throw new Exceptions.RequestFailedException(uri, new Exception("Deserialization error"));
+            return result;
+        }
+
+        private async Task<responseType> GetResponseData<responseType>(Uri uri, string jsonPath)
+        {
+            var response = await GetMessageReturnResponse(uri, HttpStatusCode.OK);
+            var result = JsonSerializer.Deserialize<responseType>(response.GetPartOfJson(jsonPath));
+
+            if (result == null) throw new Exceptions.RequestFailedException(uri, new Exception("Deserialization error"));
+            return result;
         }
     }
 }
